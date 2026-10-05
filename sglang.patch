@@ -1,0 +1,1546 @@
+diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
+index 662cc25..ba1b783 100644
+--- a/python/sglang/srt/layers/logits_processor.py
++++ b/python/sglang/srt/layers/logits_processor.py
+@@ -106,6 +106,11 @@ class LogitsProcessorOutput:
+ 
+     mm_input_embeds: Optional[torch.Tensor] = None
+ 
++    trail_hidden_states: Optional[torch.Tensor] = None
++    trail_predicted_initial_lens: Optional[List[float]] = None
++    trail_predicted_remaining_lens: Optional[List[float]] = None
++    trail_prob_dists: Optional[List[torch.Tensor]] = None
++
+ 
+ @dataclasses.dataclass
+ class LogitsMetadata:
+@@ -348,6 +353,7 @@ class LogitsProcessor(nn.Module):
+                 next_token_logits=sampled_logits,
+                 hidden_states=hidden_states_to_store,
+                 mm_input_embeds=logits_metadata.mm_input_embeds,
++                trail_hidden_states=aux_pruned_states[0] if aux_pruned_states else None,
+             )
+ 
+         # Start to process input logprobs
+@@ -394,6 +400,7 @@ class LogitsProcessor(nn.Module):
+             input_token_ids_logprobs_val=logprobs_result.input_token_ids_logprobs_val,
+             input_token_ids_logprobs_idx=logprobs_result.input_token_ids_logprobs_idx,
+             mm_input_embeds=logits_metadata.mm_input_embeds,
++            trail_hidden_states=aux_pruned_states[0] if aux_pruned_states else None,
+         )
+ 
+     def _get_pruned_states(
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index 063b8d7..295b1c1 100644
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -799,6 +799,11 @@ class Req(ReqDllmMixin):
+         # For diffusion LLM
+         self.init_diffusion_llm(dllm_config)
+ 
++        self.trail_initial_pred_len = None
++        self.trail_remain_length = None
++        self.trail_prob_dist = None
++        self.trail_probe_ready = False
++
+     @property
+     def seqlen(self) -> int:
+         """Get the current sequence length of the request."""
+@@ -1949,15 +1954,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+ 
+         return retracted_reqs, new_estimate_ratio, reqs_to_abort
+ 
+-    def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
++    def release_req(
++        self,
++        idx: int,
++        remaing_req_count: int,
++        server_args: ServerArgs,
++        insert_into_cache: bool = False,
++    ):
+         req = self.reqs[idx]
+ 
+         if server_args.disaggregation_mode == "decode":
+             req.offload_kv_cache(
+                 self.req_to_token_pool, self.token_to_kv_pool_allocator
+             )
+-        # TODO (csy): for preempted requests, we may want to insert into the tree
+-        release_kv_cache(req, self.tree_cache, is_insert=False)
++        # TRAIL preemption inserts the preempted request's KV cache into the radix
++        # tree so that it can reuse its prefix when resumed. Memory-pressure
++        # retraction keeps the default (no insert).
++        release_kv_cache(req, self.tree_cache, is_insert=insert_into_cache)
+         # NOTE(lsyin): we should use the newly evictable memory instantly.
+         num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
+         evict_from_tree_cache(self.tree_cache, num_tokens)
+diff --git a/python/sglang/srt/managers/schedule_policy.py b/python/sglang/srt/managers/schedule_policy.py
+index dbce816..383ec38 100644
+--- a/python/sglang/srt/managers/schedule_policy.py
++++ b/python/sglang/srt/managers/schedule_policy.py
+@@ -76,6 +76,32 @@ IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD = int(
+ 
+ IGNORE_EOS_RESERVE_TOKENS = 1
+ 
++# TRAIL: limited preemption. A running request may be preempted only during its
++# first c * (initial predicted length) decode steps, where c is this limit.
++TRAIL_PREEMPTION_LIMIT = float(os.environ.get("SGLANG_TRAIL_PREEMPTION_LIMIT", "0.8"))
++TRAIL_DEBUG = os.environ.get("SGLANG_TRAIL_DEBUG", "0") == "1"
++
++
++def trail_preempt_limit() -> float:
++    return TRAIL_PREEMPTION_LIMIT
++
++
++def trail_preemption_enabled() -> bool:
++    # c = 0 leaves no preemptible window, so TRAIL only orders the waiting queue.
++    return TRAIL_ENABLE_MINIMAL_PREEMPTION and TRAIL_PREEMPTION_LIMIT > 0
++
++
++TRAIL_PREEMPTION_MARGIN = float(os.environ.get("SGLANG_TRAIL_PREEMPTION_MARGIN", "0.0"))
++TRAIL_ENABLE_MINIMAL_PREEMPTION = (
++    os.environ.get("SGLANG_TRAIL_ENABLE_MINIMAL_PREEMPTION", "1") == "1"
++)
++# Maximum number of times one request may be preempted (0 = no limit).
++TRAIL_MAX_PREEMPTIONS_PER_REQ = int(
++    os.environ.get("SGLANG_TRAIL_MAX_PREEMPTIONS_PER_REQ", "0")
++)
++# Count of committed TRAIL preemptions, logged periodically at info level.
++_trail_preempt_committed = [0]
++
+ 
+ class CacheAwarePolicy(Enum):
+     """Scheduling policies that are aware of the tree cache."""
+@@ -91,6 +117,7 @@ class CacheAgnosticPolicy(Enum):
+     LOF = "lof"  # longest output first
+     RANDOM = "random"
+     ROUTING_KEY = "routing-key"  # prioritize by routing key frequency in running batch
++    TRAIL = "trail"  # Limited Refined-Prediction SPRPT (TRAIL / LRPSPRPT)
+ 
+ 
+ class SchedulePolicy:
+@@ -154,6 +181,12 @@ class SchedulePolicy:
+             elif policy == CacheAgnosticPolicy.ROUTING_KEY:
+                 if running_batch is not None:
+                     SchedulePolicy._sort_by_routing_key(waiting_queue, running_batch)
++            elif policy == CacheAgnosticPolicy.TRAIL:
++                SchedulePolicy._sort_by_trail(
++                    waiting_queue,
++                    self.enable_priority_scheduling,
++                    self.priority_sign,
++                )
+             else:
+                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
+         return prefix_computed
+@@ -170,6 +203,11 @@ class SchedulePolicy:
+         """
+         Validates the policy and adjusts it if necessary based on tree cache settings.
+         """
++        normalized_policy = policy.strip().lower()
++        if normalized_policy in ("trail", "lrpsprpt"):
++            return CacheAgnosticPolicy.TRAIL
++        if policy == "LRPSPRPT":
++            return CacheAgnosticPolicy.TRAIL
+         try:
+             policy_enum = CacheAwarePolicy(policy)
+             if getattr(tree_cache, "disable", True):
+@@ -242,6 +280,15 @@ class SchedulePolicy:
+                     )
+         return temporary_deprioritized
+ 
++    @staticmethod
++    def _req_priority_value(req: Req) -> int:
++        return req.priority if getattr(req, "priority", None) is not None else 0
++
++    @staticmethod
++    def _trail_debug(msg: str, *args) -> None:
++        if TRAIL_DEBUG:
++            logger.debug(msg, *args)
++
+     @staticmethod
+     def _sort_by_longest_prefix(
+         waiting_queue: List[Req], temporary_deprioritized: Set[int]
+@@ -287,13 +334,180 @@ class SchedulePolicy:
+         if enable_priority_scheduling:
+             waiting_queue.sort(
+                 key=lambda x: (
+-                    x.priority * priority_sign,
++                    SchedulePolicy._req_priority_value(x) * priority_sign,
+                     -x.sampling_params.max_new_tokens,
+                 )
+             )
+         else:
+             waiting_queue.sort(key=lambda x: -x.sampling_params.max_new_tokens)
+ 
++    @staticmethod
++    def _get_generated_len(req: Req) -> int:
++        """Best-effort generated-token count for an SGLang request."""
++        output_ids = getattr(req, "output_ids", None)
++        if output_ids is not None:
++            try:
++                return len(output_ids)
++            except TypeError:
++                pass
++
++        for attr in ("generated_len", "num_generated_tokens", "output_len"):
++            value = getattr(req, attr, None)
++            if isinstance(value, int):
++                return value
++
++        return 0
++
++    @staticmethod
++    def _ensure_trail_state(req: Req) -> Optional[float]:
++        remain = getattr(req, "trail_remain_length", None)
++        if remain is not None:
++            return float(remain)
++
++        sampling_params = getattr(req, "sampling_params", None)
++        if sampling_params is not None:
++            remain = getattr(sampling_params, "remain_length", None)
++            if remain is not None:
++                if isinstance(remain, (list, tuple)):
++                    remain = float(remain[0]) if len(remain) > 0 else None
++                elif isinstance(remain, (int, float)):
++                    remain = float(remain)
++                else:
++                    remain = None
++
++                if remain is not None:
++                    req.trail_remain_length = remain
++                    if getattr(req, "trail_initial_pred_len", None) is None:
++                        req.trail_initial_pred_len = remain
++                    return remain
++
++        return None
++
++    @staticmethod
++    def _get_trail_remain_length(req: Req) -> Optional[float]:
++        remain = getattr(req, "trail_remain_length", None)
++        if remain is not None:
++            return float(remain)
++        return SchedulePolicy._ensure_trail_state(req)
++
++    @staticmethod
++    def _get_trail_initial_pred(req: Req) -> Optional[float]:
++        initial_pred = getattr(req, "trail_initial_pred_len", None)
++        if initial_pred is not None:
++            return float(initial_pred)
++
++        remain = SchedulePolicy._get_trail_remain_length(req)
++        if remain is not None:
++            return float(remain)
++
++        return None
++
++    @staticmethod
++    def _trail_priority_value(
++        req: Req,
++        t_limit: float = None,
++    ) -> float:
++        """
++        Lower values are better.
++
++        TRAIL uses:
++        - req.trail_initial_pred_len: scalar float
++        - req.trail_remain_length: scalar float
++
++        Requests past the limited-preemption cutoff are assigned +inf.
++        """
++        if t_limit is None:
++            t_limit = trail_preempt_limit()
++        generated_len = SchedulePolicy._get_generated_len(req)
++        current_pred = SchedulePolicy._get_trail_remain_length(req)
++        initial_pred = SchedulePolicy._get_trail_initial_pred(req)
++
++        if current_pred is None or initial_pred is None:
++            return float("inf")
++
++        initial_pred = max(float(initial_pred), 1.0)
++        current_pred = max(float(current_pred), 0.0)
++
++        if generated_len > 0:
++            SchedulePolicy._trail_debug(
++                "TRAIL priority rid=%s generated=%s initial_pred=%s current_pred=%s max_new_tokens=%s",
++                getattr(req, "rid", None),
++                generated_len,
++                initial_pred,
++                current_pred,
++                getattr(getattr(req, "sampling_params", None), "max_new_tokens", None),
++            )
++
++        if generated_len > t_limit * initial_pred:
++            return float("inf")
++
++        return current_pred
++
++    @staticmethod
++    def _is_trail_preemptible(
++        req: Req,
++        t_limit: float = None,
++    ) -> bool:
++        if t_limit is None:
++            t_limit = trail_preempt_limit()
++        generated_len = SchedulePolicy._get_generated_len(req)
++        initial_pred = SchedulePolicy._get_trail_initial_pred(req)
++
++        if initial_pred is None:
++            return False
++        if (
++            TRAIL_MAX_PREEMPTIONS_PER_REQ > 0
++            and getattr(req, "trail_num_preempted", 0) >= TRAIL_MAX_PREEMPTIONS_PER_REQ
++        ):
++            return False
++
++        initial_pred = max(float(initial_pred), 1.0)
++        cutoff = t_limit * initial_pred
++        result = generated_len <= cutoff
++
++        SchedulePolicy._trail_debug(
++            "TRAIL preemptible check rid=%s generated=%s initial_pred=%s cutoff=%s result=%s",
++            getattr(req, "rid", None),
++            generated_len,
++            initial_pred,
++            cutoff,
++            result,
++        )
++        return result
++
++    @staticmethod
++    def _sort_by_trail(
++        waiting_queue: List[Req],
++        enable_priority_scheduling: bool,
++        priority_sign: int,
++        t_limit: float = None,
++    ) -> None:
++        """
++        Sort waiting requests by Limited Refined-Prediction SPRPT
++        (TRAIL / LRPSPRPT).
++
++        Lower predicted remaining length wins. Requests past the
++        limited-preemption cutoff are assigned +inf and naturally deprioritized.
++        """
++        if t_limit is None:
++            t_limit = trail_preempt_limit()
++
++        if enable_priority_scheduling:
++            waiting_queue.sort(
++                key=lambda req: (
++                    SchedulePolicy._req_priority_value(req) * priority_sign,
++                    SchedulePolicy._trail_priority_value(req, t_limit),
++                    req.time_stats.wait_queue_entry_time,
++                )
++            )
++        else:
++            waiting_queue.sort(
++                key=lambda req: (
++                    SchedulePolicy._trail_priority_value(req, t_limit),
++                    req.time_stats.wait_queue_entry_time,
++                )
++            )
++
+     @staticmethod
+     def _sort_randomly(waiting_queue: List[Req]) -> None:
+         """Shuffles the waiting queue randomly."""
+@@ -306,7 +520,7 @@ class SchedulePolicy:
+         """Sorts the waiting queue based on the request priority then received titmestamp."""
+         waiting_queue.sort(
+             key=lambda x: (
+-                x.priority * priority_sign,
++                SchedulePolicy._req_priority_value(x) * priority_sign,
+                 x.time_stats.wait_queue_entry_time,
+             )
+         )
+@@ -847,6 +1061,161 @@ class PrefillAdder:
+         Preempt running requests to serve the new request if the priority threshold is met and token count sum is verified.
+         Returns True if preemption was committed, and the new request can be scheduled.
+         """
++        SchedulePolicy._trail_debug(
++            "preempt_to_schedule entered incoming=%s running_batch_size=%s rem_total_tokens=%s running_rids=%s",
++            getattr(req, "rid", None),
++            len(self.running_batch.reqs) if self.running_batch is not None else None,
++            getattr(self, "rem_total_tokens", None),
++            (
++                [getattr(r, "rid", None) for r in self.running_batch.reqs]
++                if self.running_batch is not None
++                else None
++            ),
++        )
++        schedule_policy = getattr(server_args, "schedule_policy", "")
++        is_trail_policy = str(schedule_policy).strip().lower() in (
++            "trail",
++            "lrpsprpt",
++        )
++
++        if is_trail_policy:
++            incoming_value = SchedulePolicy._trail_priority_value(req)
++            incoming_generated = SchedulePolicy._get_generated_len(req)
++            incoming_initial_pred = SchedulePolicy._get_trail_initial_pred(req)
++            incoming_remain = SchedulePolicy._get_trail_remain_length(req)
++
++            # Bootstrap fallback for unseen requests.
++            if incoming_initial_pred is None or incoming_remain is None:
++                fallback = max(
++                    1.0,
++                    float(
++                        getattr(
++                            getattr(req, "sampling_params", None), "max_new_tokens", 0
++                        )
++                        or 0
++                    ),
++                )
++                incoming_value = fallback
++                incoming_initial_pred = fallback
++                incoming_remain = fallback
++
++            SchedulePolicy._trail_debug(
++                "TRAIL dry-run preemption incoming rid=%s generated=%s initial_pred=%s remain=%s score=%s",
++                getattr(req, "rid", None),
++                incoming_generated,
++                incoming_initial_pred,
++                incoming_remain,
++                incoming_value,
++            )
++
++            valid_running_reqs = [
++                r
++                for r in self.running_batch.reqs
++                if r not in self.preempt_list and not r.finished()
++            ]
++
++            candidate_reqs = []
++            for running_req in valid_running_reqs:
++                running_value = SchedulePolicy._trail_priority_value(running_req)
++                running_generated = SchedulePolicy._get_generated_len(running_req)
++                running_initial_pred = SchedulePolicy._get_trail_initial_pred(
++                    running_req
++                )
++                running_remain = SchedulePolicy._get_trail_remain_length(running_req)
++                running_preemptible = SchedulePolicy._is_trail_preemptible(running_req)
++
++                SchedulePolicy._trail_debug(
++                    "TRAIL compare incoming=%s running=%s running_generated=%s running_initial_pred=%s running_remain=%s running_score=%s preemptible=%s",
++                    getattr(req, "rid", None),
++                    getattr(running_req, "rid", None),
++                    running_generated,
++                    running_initial_pred,
++                    running_remain,
++                    running_value,
++                    running_preemptible,
++                )
++
++                if (
++                    running_preemptible
++                    and incoming_value + TRAIL_PREEMPTION_MARGIN < running_value
++                ):
++                    candidate_reqs.append((running_value, running_req))
++
++            SchedulePolicy._trail_debug(
++                "TRAIL dry-run would_preempt incoming=%s candidates=%s",
++                getattr(req, "rid", None),
++                [getattr(r, "rid", None) for _, r in candidate_reqs],
++            )
++
++            if not candidate_reqs:
++                return False
++
++            if not TRAIL_ENABLE_MINIMAL_PREEMPTION:
++                SchedulePolicy._trail_debug(
++                    "TRAIL minimal preemption disabled incoming=%s",
++                    getattr(req, "rid", None),
++                )
++                return False
++
++            victim_value, victim = max(candidate_reqs, key=lambda x: x[0])
++
++            logger.debug(
++                "TRAIL committing minimal preemption incoming=%s victim=%s incoming_score=%s victim_score=%s",
++                getattr(req, "rid", None),
++                getattr(victim, "rid", None),
++                incoming_value,
++                victim_value,
++            )
++
++            victim_index = None
++            for i, running_req in enumerate(self.running_batch.reqs):
++                if running_req is victim:
++                    victim_index = i
++                    break
++
++            if victim_index is None:
++                logger.warning(
++                    "TRAIL victim not found in running batch incoming=%s victim=%s",
++                    getattr(req, "rid", None),
++                    getattr(victim, "rid", None),
++                )
++                return False
++
++            self.rem_total_token_offset -= self._get_running_request_total_token_offset(
++                victim
++            )
++
++            self.running_batch.release_req(
++                victim_index,
++                len(self.running_batch.reqs) - 1,
++                server_args,
++                insert_into_cache=True,
++            )
++
++            keep_indices = [
++                i for i in range(len(self.running_batch.reqs)) if i != victim_index
++            ]
++            self.running_batch.filter_batch(keep_indices=keep_indices)
++
++            self.preempt_list.append(victim)
++            victim.trail_num_preempted = getattr(victim, "trail_num_preempted", 0) + 1
++
++            logger.debug(
++                "TRAIL committed minimal preemption incoming=%s victim=%s incoming_score=%s victim_score=%s",
++                getattr(req, "rid", None),
++                getattr(victim, "rid", None),
++                incoming_value,
++                victim_value,
++            )
++
++            _trail_preempt_committed[0] += 1
++            if _trail_preempt_committed[0] % 50 == 1:
++                logger.info(
++                    "TRAIL committed preemptions so far: %d", _trail_preempt_committed[0]
++                )
++
++            return True
++
+         # Iterate running requests to find preemptible requests
+         priority_sign = 1 if server_args.schedule_low_priority_values_first else -1
+ 
+@@ -865,7 +1234,7 @@ class PrefillAdder:
+         sorted_valid_running_reqs = sorted(
+             valid_running_reqs,
+             key=lambda x: (
+-                x.priority * (-priority_sign),
++                SchedulePolicy._req_priority_value(x) * (-priority_sign),
+                 -x.time_stats.wait_queue_entry_time,
+             ),
+         )
+@@ -878,7 +1247,10 @@ class PrefillAdder:
+         )
+         for running_req in sorted_valid_running_reqs:
+             # Priority difference needs to meet the threshold to be preemptible.
+-            priority_diff = (req.priority - running_req.priority) * (-priority_sign)
++            priority_diff = (
++                SchedulePolicy._req_priority_value(req)
++                - SchedulePolicy._req_priority_value(running_req)
++            ) * (-priority_sign)
+ 
+             if priority_diff > self.priority_scheduling_preemption_threshold:
+                 preemptible_reqs.append(running_req)
+@@ -905,7 +1277,10 @@ class PrefillAdder:
+                 )
+                 release_counter += 1
+                 self.running_batch.release_req(
+-                    i, len(self.running_batch.reqs) - release_counter, server_args
++                    i,
++                    len(self.running_batch.reqs) - release_counter,
++                    server_args,
++                    insert_into_cache=True,
+                 )
+             else:
+                 keep_indices.append(i)
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 42e841f..150c924 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -15,7 +15,9 @@
+ 
+ import faulthandler
+ import logging
++import math
+ import os
++import random
+ import signal
+ import sys
+ import time
+@@ -157,6 +159,7 @@ from sglang.srt.managers.schedule_policy import (
+     AddReqResult,
+     PrefillAdder,
+     SchedulePolicy,
++    trail_preemption_enabled,
+ )
+ from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
+ from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
+@@ -425,6 +428,46 @@ class Scheduler(
+ 
+         self.is_initializing = False
+ 
++        self._init_trail()
++
++    def _init_trail(self):
++        """Set up TRAIL's length predictors (only used by --schedule-policy trail)."""
++        from sglang.srt.managers.trail_initial_predictor import TrailInitialPredictor
++
++        is_trail_policy = str(
++            getattr(self.server_args, "schedule_policy", "")
++        ).strip().lower() in ("trail", "lrpsprpt")
++
++        # Initial predictor: a DistilBERT classifier on the prompt text. It gives every
++        # waiting request a length estimate before its prefill. Runs on GPU by default;
++        # on CPU its forward pass stalls the scheduler loop.
++        self.trail_initial_predictor = None
++        trail_initial_dir = os.environ.get("SGLANG_TRAIL_INITIAL_PREDICTOR_DIR", "")
++        if is_trail_policy and trail_initial_dir:
++            self.trail_initial_predictor = TrailInitialPredictor(
++                model_dir=trail_initial_dir,
++                device=os.environ.get("SGLANG_TRAIL_INITIAL_DEVICE", "cuda"),
++            )
++            logger.info("TRAIL initial predictor loaded from %s", trail_initial_dir)
++
++        # Oracle mode (TRAIL+): predictions come from the true remaining length instead
++        # of the trained predictors. The true length is max_new_tokens - generated, so
++        # requests must be sent with ignore_eos=True and max_tokens set to their actual
++        # output length. SGLANG_TRAIL_ORACLE_MAE > 0 adds zero-mean Gaussian noise with
++        # that mean absolute error (in tokens), for sensitivity studies.
++        self.trail_oracle = os.environ.get("SGLANG_TRAIL_ORACLE", "0") == "1"
++        self.trail_oracle_mae = float(os.environ.get("SGLANG_TRAIL_ORACLE_MAE", "0"))
++        # For X ~ N(0, sigma): E|X| = sigma * sqrt(2/pi)  =>  sigma = MAE * sqrt(pi/2).
++        self.trail_oracle_sigma = self.trail_oracle_mae * math.sqrt(math.pi / 2.0)
++        self.trail_oracle_rng = random.Random(
++            int(os.environ.get("SGLANG_TRAIL_ORACLE_SEED", "0"))
++        )
++        if is_trail_policy and self.trail_oracle:
++            logger.info(
++                "TRAIL oracle predictor enabled (noise MAE=%.1f tokens)",
++                self.trail_oracle_mae,
++            )
++
+     def init_model_config(self):
+         self.model_config = ModelConfig.from_server_args(self.server_args)
+         if _is_npu:
+@@ -857,8 +900,15 @@ class Scheduler(
+                 ),
+             )
+ 
+-        # NOTE: preemption is enabled by default for priority scheduling.
++        schedule_policy_name = (
++            str(getattr(self.server_args, "schedule_policy", "")).strip().lower()
++        )
++        is_trail_policy = schedule_policy_name in ("trail", "lrpsprpt")
++
++        # TRAIL preempts only when limited preemption is on (c > 0).
+         self.enable_priority_preemption = (
++            is_trail_policy and trail_preemption_enabled()
++        ) or (
+             self.enable_priority_scheduling
+             and not self.server_args.disable_priority_preemption
+         )
+@@ -2203,6 +2253,7 @@ class Scheduler(
+             return None
+ 
+         # Get priority queue
++        self._apply_initial_trail_predictions(self.waiting_queue)
+         self.policy.calc_priority(self.waiting_queue, self.running_batch)
+ 
+         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
+@@ -2272,10 +2323,11 @@ class Scheduler(
+                     self.running_batch.batch_is_full = True
+ 
+             if self.running_batch.batch_is_full:
+-                if (
+-                    not self.enable_priority_preemption
+-                    or not adder.preempt_to_schedule(req, self.server_args)
+-                ):
++                preempt_result = False
++                if self.enable_priority_preemption:
++                    preempt_result = adder.preempt_to_schedule(req, self.server_args)
++
++                if (not self.enable_priority_preemption) or (not preempt_result):
+                     break
+ 
+             if self.enable_hicache_storage:
+@@ -2382,6 +2434,128 @@ class Scheduler(
+ 
+         return new_batch
+ 
++    def _trail_oracle_remaining(self, req) -> Tuple[int, int]:
++        """(max_new_tokens, true remaining length) of a request in oracle mode."""
++        mnt = int(
++            getattr(getattr(req, "sampling_params", None), "max_new_tokens", 0) or 0
++        )
++        generated = len(getattr(req, "output_ids", []) or [])
++        return mnt, max(mnt - generated, 0)
++
++    def _trail_oracle_noisy(self, value: int) -> float:
++        if self.trail_oracle_sigma <= 0:
++            return float(value)
++        return float(round(value + self.trail_oracle_rng.gauss(0.0, self.trail_oracle_sigma)))
++
++    def _apply_initial_trail_predictions(self, reqs):
++        """Give each newly arrived request an initial length prediction."""
++        if not reqs:
++            return
++
++        if self.trail_oracle:
++            for req in reqs:
++                if getattr(req, "trail_initial_pred_len", None) is not None:
++                    continue
++                mnt, _ = self._trail_oracle_remaining(req)
++                if mnt <= 0:
++                    continue
++                pred = max(1.0, self._trail_oracle_noisy(mnt))
++                req.trail_initial_pred_len = pred
++                req.trail_remain_length = pred
++                req.trail_probe_ready = True
++            return
++
++        if self.trail_initial_predictor is None:
++            return
++
++        texts = []
++        valid_reqs = []
++
++        for req in reqs:
++            if getattr(req, "trail_initial_pred_len", None) is not None:
++                continue
++
++            text = getattr(req, "origin_input_text", None)
++            if text is None:
++                text = getattr(req, "input_text", None)
++
++            if text is None:
++                input_ids = getattr(req, "origin_input_ids", None) or getattr(
++                    req, "input_ids", None
++                )
++                if input_ids is not None and hasattr(self, "tokenizer"):
++                    try:
++                        text = self.tokenizer.decode(
++                            input_ids, skip_special_tokens=False
++                        )
++                    except Exception:
++                        text = None
++
++            if text:
++                texts.append(text)
++                valid_reqs.append(req)
++
++        if not valid_reqs:
++            return
++
++        preds = self.trail_initial_predictor.predict_lengths_from_texts(texts)
++        for req, pred in zip(valid_reqs, preds):
++            mnt = getattr(getattr(req, "sampling_params", None), "max_new_tokens", None)
++            if mnt:
++                pred = min(float(pred), float(mnt))
++            req.trail_initial_pred_len = float(pred)
++            req.trail_remain_length = float(pred)
++            req.trail_probe_ready = True
++            logger.debug(
++                "TRAIL initial assigned rid=%s pred=%s",
++                getattr(req, "rid", None),
++                float(pred),
++            )
++
++    def _apply_trail_predictions_to_reqs(self, reqs, logits_output):
++        """Update remaining-length predictions after a forward pass.
++
++        The embedding predictor refines a request's remaining length from its layer
++        embedding. On steps without a fresh prediction the estimate counts down by the
++        token just generated. The initial prediction is kept as the base of the
++        limited-preemption cutoff (c * initial prediction).
++        """
++        if self.trail_oracle:
++            for req in reqs:
++                mnt, remaining = self._trail_oracle_remaining(req)
++                if getattr(req, "trail_initial_pred_len", None) is None and mnt > 0:
++                    req.trail_initial_pred_len = max(1.0, self._trail_oracle_noisy(mnt))
++                req.trail_remain_length = float(
++                    min(max(self._trail_oracle_noisy(remaining), 0.0), remaining)
++                )
++                req.trail_probe_ready = True
++            return
++
++        if logits_output is None:
++            return
++
++        initials = getattr(logits_output, "trail_predicted_initial_lens", None)
++        remains = getattr(logits_output, "trail_predicted_remaining_lens", None)
++        prob_dists = getattr(logits_output, "trail_prob_dists", None)
++
++        for i, req in enumerate(reqs):
++            if remains is not None and i < len(remains):
++                req.trail_remain_length = float(remains[i])
++                if getattr(req, "trail_initial_pred_len", None) is None:
++                    if initials is not None and i < len(initials):
++                        req.trail_initial_pred_len = float(initials[i])
++                    else:
++                        generated = len(getattr(req, "output_ids", []) or [])
++                        req.trail_initial_pred_len = float(remains[i]) + generated
++            elif getattr(req, "trail_remain_length", None) is not None:
++                req.trail_remain_length = max(float(req.trail_remain_length) - 1.0, 0.0)
++
++            if prob_dists is not None and i < len(prob_dists):
++                req.trail_prob_dist = prob_dists[i]
++
++            if getattr(req, "trail_initial_pred_len", None) is not None:
++                req.trail_probe_ready = True
++
+     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
+         """Update the current running decoding batch."""
+         initial_bs = batch.batch_size()
+@@ -2521,6 +2695,9 @@ class Scheduler(
+                             model_worker_batch
+                             # here pp is not compatible with overlap
+                         )
++                        self._apply_trail_predictions_to_reqs(
++                            batch.reqs, batch_result.logits_output
++                        )
+                     # FIXME(lsyin): maybe move this to forward_batch_generation
+                     batch_result.copy_done = self.device_module.Event()
+                     if batch_result.delay_sample_func is None:
+@@ -2560,6 +2737,9 @@ class Scheduler(
+                     batch_result = self.model_worker.forward_batch_generation(
+                         worker_batch_or_batch, **kwargs
+                     )
++                    self._apply_trail_predictions_to_reqs(
++                        batch.reqs, batch_result.logits_output
++                    )
+                 future_indices_or_next_token_ids = batch_result.next_token_ids
+                 self.update_cache_from_scheduler(batch, batch_result)
+ 
+diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
+index 8f55006..439cae0 100644
+--- a/python/sglang/srt/managers/tp_worker.py
++++ b/python/sglang/srt/managers/tp_worker.py
+@@ -444,6 +444,62 @@ class TpModelWorker(BaseTpWorker):
+             self.model_runner.remote_instance_transfer_engine_weight_info,
+         )
+ 
++    def _attach_trail_metadata(
++        self,
++        forward_batch: ForwardBatch,
++        model_worker_batch: ModelWorkerBatch,
++    ):
++        reqs = getattr(model_worker_batch, "reqs", None)
++        if not reqs:
++            forward_batch.trail_rids = []
++            forward_batch.trail_generated_lens = []
++            forward_batch.trail_max_new_tokens = []
++            forward_batch.trail_prompt_lens = []
++            return
++
++        forward_batch.trail_rids = [getattr(req, "rid", None) for req in reqs]
++
++        forward_batch.trail_max_new_tokens = [
++            int(getattr(getattr(req, "sampling_params", None), "max_new_tokens", 0))
++            for req in reqs
++        ]
++
++        forward_batch.trail_prompt_lens = [
++            max(
++                len(getattr(req, "origin_input_ids", []) or []),
++                len(getattr(req, "input_ids", []) or []),
++                len(getattr(req, "fill_ids", []) or []),
++                len(getattr(req, "prompt_token_ids", []) or []),
++            )
++            for req in reqs
++        ]
++
++        forward_batch.trail_prev_prob_dists = [
++            getattr(req, "trail_prob_dist", None) for req in reqs
++        ]
++
++        forward_batch.trail_generated_lens = [
++            self._trail_get_generated_len(req) for req in reqs
++        ]
++
++    def _trail_get_generated_len(self, req) -> int:
++        candidates = [
++            getattr(req, "completion_tokens_wo_jump_forward", None),
++            getattr(req, "output_len", None),
++            len(getattr(req, "output_ids", []) or []),
++            len(getattr(req, "decode_ids", []) or []),
++        ]
++
++        for x in candidates:
++            if x is None:
++                continue
++            try:
++                return int(x)
++            except TypeError:
++                pass
++
++        return 0
++
+     def forward_batch_generation(
+         self,
+         model_worker_batch: ModelWorkerBatch,
+@@ -461,6 +517,7 @@ class TpModelWorker(BaseTpWorker):
+             self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
+ 
+             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
++            self._attach_trail_metadata(forward_batch, model_worker_batch)
+         else:
+             # FIXME(lsyin): unify the interface of forward_batch
+             assert forward_batch is not None
+@@ -540,6 +597,7 @@ class TpModelWorker(BaseTpWorker):
+         if batch.split_index == 0:
+             model_worker_batch = batch.get_model_worker_batch()
+             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
++            self._attach_trail_metadata(forward_batch, model_worker_batch)
+             batch.split_forward_batch = forward_batch
+             batch.seq_lens_cpu_cache = model_worker_batch.seq_lens_cpu
+         else:
+diff --git a/python/sglang/srt/managers/trail_initial_predictor.py b/python/sglang/srt/managers/trail_initial_predictor.py
+new file mode 100644
+index 0000000..cc1f88f
+--- /dev/null
++++ b/python/sglang/srt/managers/trail_initial_predictor.py
+@@ -0,0 +1,89 @@
++import logging
++import re
++from pathlib import Path
++
++import torch
++from transformers import AutoModelForSequenceClassification, AutoTokenizer
++
++logger = logging.getLogger(__name__)
++
++
++# Llama-3 chat template: the predictor was trained on the raw prompt, so keep only the
++# content of the last user turn when the text is a rendered chat.
++_LLAMA3_USER_TURN = re.compile(
++    r"<\|start_header_id\|>user<\|end_header_id\|>\s*(.*?)<\|eot_id\|>", re.S
++)
++
++
++def extract_prompt(text: str) -> str:
++    turns = _LLAMA3_USER_TURN.findall(text)
++    return turns[-1].strip() if turns else text
++
++
++class TrailInitialPredictor:
++    def __init__(self, model_dir: str, device: str = "cpu"):
++        self.model_dir = str(Path(model_dir))
++        self.device = device
++
++        self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir)
++        self.model = AutoModelForSequenceClassification.from_pretrained(self.model_dir)
++        self.model.to(self.device)
++        self.model.eval()
++
++    @torch.inference_mode()
++    def predict_lengths_from_texts(self, texts: list[str]) -> list[float]:
++        if not texts:
++            return []
++
++        texts = [extract_prompt(t) for t in texts]
++        batch = self.tokenizer(
++            texts,
++            padding=True,
++            truncation=True,
++            return_tensors="pt",
++        )
++        batch = {k: v.to(self.device) for k, v in batch.items()}
++
++        outputs = self.model(**batch)
++        logits = outputs.logits
++
++        # Case 1: scalar regression head
++        if logits.ndim == 2 and logits.shape[1] == 1:
++            preds = logits[:, 0]
++            return [max(float(x.item()), 1.0) for x in preds.cpu()]
++
++        # Case 2: classification head over bins
++        if logits.ndim == 2 and logits.shape[1] > 1:
++            probs = torch.softmax(logits, dim=-1)
++
++            num_bins = logits.shape[1]
++
++            # Bins span [0, max_len] output tokens.
++            max_len = (
++                getattr(self.model.config, "trail_max_len", None)
++                or getattr(self.model.config, "max_len", None)
++                or 512
++            )
++
++            bin_edges = torch.linspace(
++                0,
++                float(max_len),
++                steps=num_bins + 1,
++                device=probs.device,
++                dtype=probs.dtype,
++            )
++            bin_midpoints = (bin_edges[:-1] + bin_edges[1:]) / 2.0
++
++            expected = (probs * bin_midpoints.unsqueeze(0)).sum(dim=-1)
++            logger.debug(
++                "TRAIL initial predictor expected lengths=%s",
++                [round(float(x.item()), 2) for x in expected.cpu()],
++            )
++            return [max(float(x.item()), 1.0) for x in expected.cpu()]
++
++        raise RuntimeError(
++            f"Unsupported alpaca_length_predictor logits shape: {tuple(logits.shape)}"
++        )
++
++    def predict_length_from_text(self, text: str) -> float:
++        return self.predict_lengths_from_texts([text])[0]
+diff --git a/python/sglang/srt/managers/trail_predictor.py b/python/sglang/srt/managers/trail_predictor.py
+new file mode 100644
+index 0000000..f5d2269
+--- /dev/null
++++ b/python/sglang/srt/managers/trail_predictor.py
+@@ -0,0 +1,230 @@
++import json
++import logging
++import os
++from dataclasses import dataclass
++
++import torch
++import torch.nn as nn
++from safetensors.torch import load_file
++
++logger = logging.getLogger(__name__)
++
++@dataclass
++class TrailPredictorConfig:
++    hidden_size: int = 4096
++    num_labels: int = 10
++    max_len: int = 512
++    probe_layer_idx: int = 11
++    hidden_dim: int = 512
++    device: str = "cpu"
++    dtype: str = "float32"
++
++
++class TrailMLP(nn.Module):
++    def __init__(self, hidden_size: int, hidden_dim: int, num_labels: int):
++        super().__init__()
++        self.fc1 = nn.Linear(hidden_size, hidden_dim)
++        self.act = nn.ReLU()
++        self.fc2 = nn.Linear(hidden_dim, num_labels)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return self.fc2(self.act(self.fc1(x)))
++
++
++class TrailPredictorRuntime:
++    def __init__(self, model_dir: str):
++        self.model_dir = model_dir
++        self.cfg = self._load_cfg(model_dir)
++        self.model = self._load_model(model_dir, self.cfg)
++        self.bin_edges = torch.linspace(0, self.cfg.max_len, self.cfg.num_labels + 1)
++        self.bin_midpoints = (self.bin_edges[:-1] + self.bin_edges[1:]) / 2
++        self.transition = self._build_transition()
++
++    def _load_cfg(self, model_dir: str) -> TrailPredictorConfig:
++        path = os.path.join(model_dir, "config.json")
++        cfg = TrailPredictorConfig()
++        if os.path.exists(path):
++            with open(path, "r") as f:
++                raw = json.load(f)
++            cfg.hidden_size = raw.get(
++                "hidden_size", raw.get("input_dim", cfg.hidden_size)
++            )
++            cfg.num_labels = raw.get("num_labels", cfg.num_labels)
++            cfg.max_len = raw.get("max_len", raw.get("max_position", cfg.max_len))
++            cfg.probe_layer_idx = raw.get(
++                "probe_layer_idx", raw.get("layer_idx", cfg.probe_layer_idx)
++            )
++            cfg.hidden_dim = raw.get(
++                "hidden_dim", raw.get("intermediate_size", cfg.hidden_dim)
++            )
++            cfg.device = raw.get("device", cfg.device)
++            cfg.dtype = raw.get("dtype", cfg.dtype)
++        return cfg
++
++    def _load_model(self, model_dir: str, cfg: TrailPredictorConfig) -> nn.Module:
++        model = TrailMLP(
++            hidden_size=cfg.hidden_size,
++            hidden_dim=cfg.hidden_dim,
++            num_labels=cfg.num_labels,
++        )
++
++        pt_path = os.path.join(model_dir, "model.pt")
++        st_path = os.path.join(model_dir, "model.safetensors")
++
++        if os.path.exists(pt_path):
++            state = torch.load(pt_path, map_location="cpu")
++        elif os.path.exists(st_path):
++            state = load_file(st_path, device="cpu")
++        else:
++            logger.warning("TRAIL predictor weights not found in %s", model_dir)
++            model.eval()
++            return model
++
++        remap = {}
++        for k, v in state.items():
++            if k.startswith("fc1.") or k.startswith("fc2."):
++                nk = k
++            elif k.startswith("0."):
++                nk = "fc1." + k[len("0.") :]
++            elif k.startswith("2."):
++                nk = "fc2." + k[len("2.") :]
++            elif k.startswith("layers.0."):
++                nk = "fc1." + k[len("layers.0.") :]
++            elif k.startswith("layers.2."):
++                nk = "fc2." + k[len("layers.2.") :]
++            else:
++                nk = k
++            remap[nk] = v
++
++        missing, unexpected = model.load_state_dict(remap, strict=False)
++        if missing:
++            raise RuntimeError(f"Missing predictor weights: {missing}")
++        if unexpected:
++            logger.warning("Unexpected TRAIL predictor weights: %s", unexpected)
++
++        dtype = getattr(torch, cfg.dtype) if isinstance(cfg.dtype, str) else cfg.dtype
++        model = model.to(device=cfg.device, dtype=dtype)
++        model.eval()
++        return model
++
++    def _build_transition(self) -> torch.Tensor:
++        k = self.cfg.num_labels
++        T = torch.zeros(k, k, dtype=torch.float32)
++
++        bin_size = self.cfg.max_len / k
++        step_prob = min(1.0, 1.0 / max(bin_size, 1.0))
++
++        for i in range(k):
++            if i == 0:
++                T[i, i] = 1.0
++            else:
++                T[i, i] = 1.0 - step_prob
++                T[i, i - 1] = step_prob
++
++        T = T / T.sum(dim=-1, keepdim=True).clamp_min(1e-8)
++        return T
++
++    @torch.inference_mode()
++    def logits_to_probs(self, emb: torch.Tensor) -> torch.Tensor:
++        param = next(self.model.parameters())
++        emb = emb.to(device=param.device, dtype=param.dtype)
++        logits = self.model(emb)
++        return torch.softmax(logits, dim=-1)
++
++    def transition_for(self, steps: int) -> torch.Tensor:
++        # Transition matrix across `steps` decode steps (predictions may be refined
++        # only every few steps).
++        steps = max(int(steps), 1)
++        cache = self.__dict__.setdefault("_transition_cache", {})
++        if steps not in cache:
++            cache[steps] = torch.linalg.matrix_power(self.transition, steps)
++        return cache[steps]
++
++    def probs_to_expected_len(self, probs: torch.Tensor) -> float:
++        return float((probs * self.bin_midpoints.to(probs.device)).sum().item())
++
++
++def smooth_probs(prev_post, curr_probs, transition):
++    if prev_post is None:
++        return curr_probs / curr_probs.sum().clamp_min(1e-8)
++
++    prior = prev_post @ transition
++    post = prior * curr_probs
++    post = post / post.sum().clamp_min(1e-8)
++    return post
++
++
++def _to_col(values, n, dev):
++    # Build a [n] float tensor on dev from an optional per-row list.
++    if values is None:
++        return torch.zeros(n, device=dev)
++    return torch.tensor([float(v) for v in values[:n]]).to(dev, non_blocking=True)
++
++
++@torch.inference_mode()
++def predict_prefill_from_embeddings(prefill_avg_embs, max_new_tokens_list, runtime):
++    # Batched on the embedding's device; one CPU transfer at the end.
++    if prefill_avg_embs is None or prefill_avg_embs.shape[0] == 0:
++        return [], [], []
++
++    probs = runtime.logits_to_probs(prefill_avg_embs)          # [B, K] on model device
++    probs = probs / probs.sum(-1, keepdim=True).clamp_min(1e-8)
++    dev = probs.device
++    B = probs.shape[0]
++    mids = runtime.bin_midpoints.to(dev)
++    preds = (probs * mids).sum(-1)                             # [B]
++    cap = _to_col(max_new_tokens_list, B, dev)
++    preds = preds.clamp_min(0.0).minimum(cap) if max_new_tokens_list is not None \
++        else preds.clamp_min(0.0)
++
++    out = torch.cat([preds.unsqueeze(-1), probs], dim=-1).float().cpu()
++    preds_cpu = out[:, 0].tolist()
++    return preds_cpu, list(preds_cpu), list(out[:, 1:].unbind(0))
++
++
++@torch.inference_mode()
++def predict_decode_from_embeddings(
++    prev_prob_dists,
++    decode_embs,
++    generated_lens,
++    max_new_tokens_list,
++    runtime,
++    steps: int = 1,
++):
++    # Batched MLP forward + Bayesian smoothing over the in-flight batch.
++    # Rows without a prior use the current prediction directly.
++    if decode_embs is None or decode_embs.shape[0] == 0:
++        return [], []
++
++    probs = runtime.logits_to_probs(decode_embs)               # [B, K] on model device
++    probs = probs / probs.sum(-1, keepdim=True).clamp_min(1e-8)
++    dev = probs.device
++    B, K = probs.shape
++    T = runtime.transition_for(steps).to(dev)
++    mids = runtime.bin_midpoints.to(dev)
++
++    # Assemble the previous posteriors on the CPU and copy them over in one transfer.
++    prev_cpu = torch.zeros(B, K)
++    has_prev_cpu = torch.zeros(B, dtype=torch.bool)
++    if prev_prob_dists is not None:
++        for i in range(min(B, len(prev_prob_dists))):
++            p = prev_prob_dists[i]
++            if p is not None:
++                prev_cpu[i] = p
++                has_prev_cpu[i] = True
++    prev_mat = prev_cpu.to(dev, non_blocking=True)
++    has_prev = has_prev_cpu.to(dev, non_blocking=True)
++    prev_mat = prev_mat / prev_mat.sum(-1, keepdim=True).clamp_min(1e-8)
++
++    prior = prev_mat @ T                                       # [B, K]
++    post = prior * probs
++    post = post / post.sum(-1, keepdim=True).clamp_min(1e-8)
++    post = torch.where(has_prev.unsqueeze(-1), post, probs)    # no-prior rows -> curr
++
++    preds = (post * mids).sum(-1)                              # [B]
++    cap = (_to_col(max_new_tokens_list, B, dev) - _to_col(generated_lens, B, dev)).clamp_min(0.0)
++    preds = preds.clamp_min(0.0).minimum(cap)
++
++    # One device-to-host copy for both the predictions and the posteriors.
++    out = torch.cat([preds.unsqueeze(-1), post], dim=-1).float().cpu()
++    return out[:, 0].tolist(), list(out[:, 1:].unbind(0))
+diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
+index 027ab6e..720d252 100644
+--- a/python/sglang/srt/model_executor/forward_batch_info.py
++++ b/python/sglang/srt/model_executor/forward_batch_info.py
+@@ -429,6 +429,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
+     # For dumper: request IDs for cross-step sequence tracking
+     rids: Optional[List[str]] = None
+ 
++    # for TRAIL scheduling
++    trail_rids: Optional[List[str]] = None
++    trail_generated_lens: Optional[List[int]] = None
++    trail_max_new_tokens: Optional[List[int]] = None
++    trail_prompt_lens: Optional[List[int]] = None
++    trail_prev_prob_dists: Optional[List[Optional[torch.Tensor]]] = None
++
+     @classmethod
+     def init_new(
+         cls,
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 93a5ccc..cb5b4a3 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -26,6 +26,7 @@ import threading
+ import time
+ from collections import defaultdict
+ from dataclasses import dataclass
++from pathlib import Path
+ from typing import Callable, List, Optional, Tuple, Union
+ 
+ import torch
+@@ -118,6 +119,11 @@ from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
+ from sglang.srt.lora.lora_manager import LoRAManager
+ from sglang.srt.lora.lora_registry import LoRARef
+ from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
++from sglang.srt.managers.trail_predictor import (
++    TrailPredictorRuntime,
++    predict_decode_from_embeddings,
++    predict_prefill_from_embeddings,
++)
+ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+ from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
+@@ -418,6 +424,40 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+             deep_gemm_wrapper.update_deep_gemm_config(gpu_id, server_args)
+ 
++        # TRAIL length predictor (must exist before the model is loaded)
++        self.trail_predictor_runtime = None
++        predictor_dir = os.environ.get("SGLANG_TRAIL_PREDICTOR_DIR", "")
++        if predictor_dir:
++            self.trail_predictor_runtime = TrailPredictorRuntime(predictor_dir)
++            logger.info("TRAIL predictor loaded from %s", predictor_dir)
++        self.trail_probe_layer = (
++            self.trail_predictor_runtime.cfg.probe_layer_idx
++            if self.trail_predictor_runtime is not None
++            else int(os.environ.get("SGLANG_TRAIL_PROBE_LAYER", "11"))
++        )
++
++        # Refine the remaining-length prediction every K decode steps (K=1: every step).
++        # Between refinements the scheduler counts the estimate down token by token.
++        self.trail_predict_every = max(
++            1, int(os.environ.get("SGLANG_TRAIL_PREDICT_EVERY", "1"))
++        )
++        self._trail_decode_step = 0
++
++        self.trail_dump_tensors = (
++            os.environ.get("SGLANG_TRAIL_DUMP_TENSORS", "0") == "1"
++        )
++        self.trail_dump_dir = os.environ.get("SGLANG_TRAIL_DUMP_DIR", "")
++
++        if self.trail_dump_tensors and self.trail_dump_dir:
++            self.trail_dump_dir = Path(self.trail_dump_dir)
++            self.trail_tensor_dir = self.trail_dump_dir / "llama_last_layer_tensor"
++            self.trail_tensor_dir.mkdir(parents=True, exist_ok=True)
++            self.trail_meta_path = self.trail_dump_dir / "trail_dump.jsonl"
++            logger.info("TRAIL tensor dumping enabled at %s", self.trail_dump_dir)
++        else:
++            self.trail_tensor_dir = None
++            self.trail_meta_path = None
++
+         # Initialize the model runner
+         self.initialize(pre_model_load_memory)
+         self.check_quantized_moe_compatibility()
+@@ -439,6 +479,126 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+         self._model_update_group = {}
+         self._weights_send_group = {}
+ 
++    def _trail_dump_examples(
++        self,
++        forward_batch,
++        trail_emb: torch.Tensor,
++        phase: str,
++    ):
++        if not self.trail_dump_tensors or self.trail_tensor_dir is None:
++            return
++        if trail_emb is None:
++            return
++
++        emb_cpu = trail_emb.detach().to(torch.float32).cpu()
++
++        rids = getattr(forward_batch, "trail_rids", None) or []
++        generated_lens = getattr(forward_batch, "trail_generated_lens", None) or []
++        max_new_tokens_list = getattr(forward_batch, "trail_max_new_tokens", None) or []
++        prompt_lens = getattr(forward_batch, "trail_prompt_lens", None) or []
++
++        n = min(
++            emb_cpu.shape[0],
++            len(rids),
++            len(generated_lens),
++            len(max_new_tokens_list),
++            len(prompt_lens),
++        )
++
++        for row in range(n):
++            iter_ts = time.time_ns()
++
++            tensor_path = self.trail_tensor_dir / f"L{self.trail_probe_layer}_{iter_ts}+.pt"
++            torch.save(emb_cpu[row : row + 1], tensor_path)
++
++            rid = rids[row]
++            generated_len = int(generated_lens[row])
++            max_new_tokens = int(max_new_tokens_list[row])
++            remaining_len = max(max_new_tokens - generated_len, 0)
++            prompt_len = int(prompt_lens[row])
++
++            record = {
++                "iter_ts": iter_ts,
++                "rid": rid,
++                "phase": phase,
++                "row": row,
++                "layer_idx": self.trail_probe_layer,
++                "shape": list(emb_cpu[row : row + 1].shape),
++                "generated_len": generated_len,
++                "max_new_tokens": max_new_tokens,
++                "remaining_len": remaining_len,
++                "prompt_len": prompt_len,
++            }
++
++            with open(self.trail_meta_path, "a", encoding="utf-8") as f:
++                f.write(json.dumps(record) + "\n")
++
++    def _trail_predict_outputs(
++        self, forward_batch, trail_emb, phase: str, logits_output
++    ):
++        if (
++            self.trail_predictor_runtime is None
++            or trail_emb is None
++            or logits_output is None
++        ):
++            return
++
++        if phase == "prefill":
++            initials, remains, prob_dists = predict_prefill_from_embeddings(
++                trail_emb,
++                getattr(forward_batch, "trail_max_new_tokens", None),
++                self.trail_predictor_runtime,
++            )
++            logits_output.trail_predicted_initial_lens = initials
++            logits_output.trail_predicted_remaining_lens = remains
++            logits_output.trail_prob_dists = prob_dists
++
++        elif phase == "decode":
++            remains, prob_dists = predict_decode_from_embeddings(
++                getattr(forward_batch, "trail_prev_prob_dists", None),
++                trail_emb,
++                getattr(forward_batch, "trail_generated_lens", None),
++                getattr(forward_batch, "trail_max_new_tokens", None),
++                self.trail_predictor_runtime,
++                steps=self.trail_predict_every,
++            )
++            logits_output.trail_predicted_remaining_lens = remains
++            logits_output.trail_prob_dists = prob_dists
++
++    def _trail_after_forward(self, forward_batch, logits_output, phase: str):
++        """Run the TRAIL embedding predictor on the captured layer embeddings."""
++        trail_hidden = getattr(logits_output, "trail_hidden_states", None)
++        trail_emb = self._trail_prepare_embedding(trail_hidden, phase=phase)
++        if trail_emb is None:
++            return
++        self._trail_dump_examples(forward_batch, trail_emb, phase=phase)
++        if phase == "decode":
++            self._trail_decode_step += 1
++            if self._trail_decode_step % self.trail_predict_every != 0:
++                return
++        if hasattr(logits_output, "next_token_logits"):
++            self._trail_predict_outputs(
++                forward_batch, trail_emb, phase=phase, logits_output=logits_output
++            )
++
++    def _trail_prepare_embedding(
++        self, trail_hidden: torch.Tensor, phase: str
++    ) -> Optional[torch.Tensor]:
++        if trail_hidden is None:
++            return None
++
++        trail_emb = trail_hidden
++        if phase == "prefill":
++            if trail_emb.dim() == 3 and trail_emb.shape[1] > 1:
++                trail_emb = trail_emb.mean(dim=1)
++            elif trail_emb.dim() == 3:
++                trail_emb = trail_emb[:, -1, :]
++        else:
++            if trail_emb.dim() == 3:
++                trail_emb = trail_emb[:, -1, :]
++
++        return trail_emb
++
+     def init_mindspore_runner(self):
+         # Init the mindspore runner
+         # for now, there is only some communication initialization work
+@@ -1084,6 +1244,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+                 self.remote_instance_transfer_engine_weight_info = (
+                     self.loader.remote_instance_transfer_engine_weight_info
+                 )
++            if hasattr(self.model, "set_trail_layer_to_capture") and (
++                self.trail_predictor_runtime is not None or self.trail_dump_tensors
++            ):
++                self.model.set_trail_layer_to_capture(self.trail_probe_layer)
++                logger.info(
++                    "TRAIL capturing layer %d embeddings on %s",
++                    self.trail_probe_layer,
++                    type(self.model).__name__,
++                )
+         monkey_patch_vllm_parallel_state(reverse=True)
+ 
+         # Publish metadata to ModelExpress if running as seed source
+@@ -2492,12 +2661,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+         kwargs = {}
+         if self.support_pp:
+             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+-        return self.model.forward(
++        logits_output_or_pp_proxy_tensors = self.model.forward(
+             forward_batch.input_ids,
+             forward_batch.positions,
+             forward_batch,
+             **kwargs,
+         )
++        self._trail_after_forward(
++            forward_batch, logits_output_or_pp_proxy_tensors, phase="decode"
++        )
++        return logits_output_or_pp_proxy_tensors
+ 
+     def forward_extend(
+         self,
+@@ -2528,14 +2701,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+ 
+         if not skip_attn_backend_init:
+             self.attn_backend.init_forward_metadata(forward_batch)
+-
++        logits_output_or_pp_proxy_tensors = self.model.forward(
++            forward_batch.input_ids,
++            forward_batch.positions,
++            forward_batch,
++            **kwargs,
++        )
++        self._trail_after_forward(
++            forward_batch, logits_output_or_pp_proxy_tensors, phase="prefill"
++        )
+         return (
+-            self.model.forward(
+-                forward_batch.input_ids,
+-                forward_batch.positions,
+-                forward_batch,
+-                **kwargs,
+-            ),
++            logits_output_or_pp_proxy_tensors,
+             can_run_graph,
+         )
+ 
+@@ -2663,6 +2839,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+                 skip_attn_backend_init=skip_attn_backend_init,
+                 pp_proxy_tensors=pp_proxy_tensors,
+             )
++            if forward_batch.forward_mode.is_decode():
++                self._trail_after_forward(forward_batch, ret, phase="decode")
+             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+ 
+         # For MLP sync
+diff --git a/python/sglang/srt/models/llama.py b/python/sglang/srt/models/llama.py
+index d8810c5..5184ddf 100644
+--- a/python/sglang/srt/models/llama.py
++++ b/python/sglang/srt/models/llama.py
+@@ -789,6 +789,15 @@ class LlamaForCausalLM(nn.Module):
+             # of the (i-1)th layer as aux hidden state
+             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+ 
++    def set_trail_layer_to_capture(self, layer_idx: int):
++        if not self.pp_group.is_last_rank:
++            return
++
++        self.capture_aux_hidden_states = True
++        # In this file, capture happens BEFORE layer i runs, which corresponds
++        # to the output of layer (i - 1). So to capture layer_idx, use layer_idx + 1.
++        self.model.layers_to_capture = [layer_idx + 1]
++
+ 
+ class Phi3ForCausalLM(LlamaForCausalLM):
+     pass
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 7a77502..6f03eea 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -3868,6 +3868,7 @@ class ServerArgs:
+                 "lof",
+                 "priority",
+                 "routing-key",
++                "trail",
+             ],
+             help="The scheduling policy of the requests.",
+         )
+diff --git a/python/sglang/srt/model_executor/cuda_graph_runner.py b/python/sglang/srt/model_executor/cuda_graph_runner.py
+index 05e2d58..90f3d39 100644
+--- a/python/sglang/srt/model_executor/cuda_graph_runner.py
++++ b/python/sglang/srt/model_executor/cuda_graph_runner.py
+@@ -1161,6 +1161,11 @@ class CudaGraphRunner:
+                     else None
+                 ),
+                 customized_info=output.customized_info,
++                trail_hidden_states=(
++                    output.trail_hidden_states[: self.raw_num_token]
++                    if output.trail_hidden_states is not None
++                    else None
++                ),
+             )
+         else:
+             assert isinstance(output, PPProxyTensors)

@@ -1,0 +1,29 @@
+{
+  "hidden_size": 4096,
+  "hidden_dim": 512,
+  "num_labels": 10,
+  "max_len": 512,
+  "probe_layer_idx": 11,
+  "dtype": "float32",
+  "device": "cuda",
+  "label_source": "actual_eos_remaining",
+  "phase_filter": "decode",
+  "split_unit": "request_hash",
+  "training_data": {
+    "source": "/data/z5709978/harvard/sglang/tensors/full_alpaca_20260718_0001",
+    "requests": 51762,
+    "samples": 804419,
+    "missing": 0,
+    "samples_per_request": 16,
+    "samples_per_shard": 256,
+    "num_shards": 3143,
+    "hidden_size": 4096,
+    "dtype": "float16",
+    "max_len": 512,
+    "num_labels": 10,
+    "validation_fraction": 0.1,
+    "split_unit": "request_hash",
+    "seed": 0
+  },
+  "seed": 0
+}

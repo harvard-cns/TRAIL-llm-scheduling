@@ -1,0 +1,7 @@
+{
+  "metric": "val_mae_tokens",
+  "epoch": 4,
+  "value": 33.87226965681782,
+  "checkpoint": "model_epoch_04.pt",
+  "deployed_checkpoint": "model.pt"
+}
